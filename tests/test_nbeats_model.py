@@ -10,10 +10,13 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-
 pytest.importorskip("darts")
 
-from energy_load_forecast.models.nbeats_model import predict, series_to_darts, train_nbeats
+from energy_load_forecast.models.nbeats_model import (
+    predict,
+    series_to_darts,
+    train_nbeats,
+)
 
 
 def _hourly_series(
