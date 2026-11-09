@@ -20,7 +20,10 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 
 from energy_load_forecast.features import add_all_features
-from energy_load_forecast.preprocessing import add_calendar_features
+from energy_load_forecast.preprocessing import (
+    add_calendar_features,
+    add_holiday_features,
+)
 
 
 def train_lightgbm(X_train: pd.DataFrame, y_train: pd.Series, **lgbm_params) -> LGBMRegressor:
@@ -194,6 +197,7 @@ def recursive_forecast(
     lags: tuple[int, ...] = (1, 24, 168),
     windows: tuple[int, ...] = (3, 24),
     tz: str = "Europe/Bucharest",
+    country: str = "RO",
 ) -> pd.Series:
     """Forecast each future hour using previous observations or predictions.
     
@@ -201,8 +205,9 @@ def recursive_forecast(
         observed history. Each prediction is then appended to the history and
         used for the following hours, so actual values from the forecast
         window never enter the features. Feature names follow
-        ``features.add_all_features`` and calendar features follow
-        ``preprocessing.add_calendar_features``.
+        ``features.add_all_features``, and calendar and holiday features follow
+        ``preprocessing.add_calendar_features`` and
+        ``preprocessing.add_holiday_features``.
     
         Args:
             model: Fitted LightGBM model.
@@ -214,6 +219,8 @@ def recursive_forecast(
             windows: Rolling window lengths in hours used when training ``model``.
             tz: IANA timezone used for calendar features. Defaults to
                 ``"Europe/Bucharest"``.
+            country: Country code used for holiday features. Defaults to
+                ``"RO"``.
     
         Returns:
             A Series of predicted load values indexed by ``future_index`` and
@@ -224,7 +231,8 @@ def recursive_forecast(
             ValueError: If the history is too short for the requested lags and
                 windows, or ``future_index`` does not start right after it.
             KeyError: If ``feature_columns`` contains a feature that cannot be
-                built from ``lags``, ``windows``, and the calendar features.
+                built from ``lags``, ``windows``, and the calendar and
+                holiday features.
     """
     if not isinstance(history, pd.Series):
         raise TypeError("history must be a pandas Series")
@@ -241,6 +249,7 @@ def recursive_forecast(
         raise ValueError("future_index must start one hour after the end of history")
 
     calendar = add_calendar_features(pd.DataFrame(index=future_index), tz=tz)
+    calendar = add_holiday_features(calendar, country=country, tz=tz)
     values = list(history.to_numpy(dtype=float))
     predictions: list[float] = []
 
@@ -263,13 +272,14 @@ def make_lightgbm_forecaster(
     lags: tuple[int, ...] = (1, 24, 168),
     windows: tuple[int, ...] = (3, 24),
     tz: str = "Europe/Bucharest",
+    country: str = "RO",
     **lgbm_params,
 ) -> Callable[[pd.Series, int], pd.Series]:
     """Build a forecasting function that retrains LightGBM on each history.
     
         The returned function matches the ``forecast_fn(history, horizon)``
         signature used by ``backtesting.rolling_origin_backtest``. Every call
-        builds calendar, lag, and rolling features from ``history`` only,
+        builds calendar, holiday, lag, and rolling features from ``history`` only,
         removes rows without enough feature history, trains a new model, and
         forecasts the next ``horizon`` hours recursively.
     
@@ -278,6 +288,8 @@ def make_lightgbm_forecaster(
             windows: Rolling window lengths in hours. Defaults to 3 and 24 hours.
             tz: IANA timezone used for calendar features. Defaults to
                 ``"Europe/Bucharest"``.
+            country: Country code used for holiday features. Defaults to
+                ``"RO"``.
             **lgbm_params: Parameters passed to ``train_lightgbm``.
     
         Returns:
@@ -287,6 +299,7 @@ def make_lightgbm_forecaster(
 
     def forecast(history: pd.Series, horizon: int) -> pd.Series:
         frame = add_calendar_features(history.to_frame(name="load_mw"), tz=tz)
+        frame = add_holiday_features(frame, country=country, tz=tz)
         features = add_all_features(frame, lags=lags, windows=windows).dropna()
         X_train = features.drop(columns=["load_mw"])
         model = train_lightgbm(X_train, features["load_mw"], **lgbm_params)
@@ -304,6 +317,7 @@ def make_lightgbm_forecaster(
             lags=lags,
             windows=windows,
             tz=tz,
+            country=country,
         )
 
     return forecast

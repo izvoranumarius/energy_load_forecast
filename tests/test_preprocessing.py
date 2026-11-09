@@ -12,6 +12,7 @@ import pytest
 
 from energy_load_forecast.preprocessing import (
     add_calendar_features,
+    add_holiday_features,
     chronological_split,
     clean_tail,
 )
@@ -123,6 +124,61 @@ class TestAddCalendarFeatures:
 
         with pytest.raises(TypeError, match="timezone-aware"):
             add_calendar_features(df)
+
+
+
+class TestAddHolidayFeatures:
+    def _daily_frame(self, start: str, days: int) -> pd.DataFrame:
+        """Helper: one row at 12:00 local time (10:00 UTC in winter) per day."""
+        index = pd.date_range(f"{start} 10:00", periods=days, freq="D", tz="UTC")
+        return pd.DataFrame({"load_mw": range(days)}, index=index)
+
+    def test_flags_christmas_and_surrounding_days(self):
+        df = self._daily_frame("2025-12-23", days=5)
+
+        result = add_holiday_features(df)
+
+        dates = result.index.strftime("%m-%d")
+        flags = result.set_axis(dates)
+        assert list(flags["is_holiday_local"]) == [False, False, True, True, False]
+        assert flags.loc["12-24", "is_day_before_holiday_local"]
+        assert flags.loc["12-27", "is_day_after_holiday_local"]
+        assert not flags.loc["12-23", "is_day_before_holiday_local"]
+
+    def test_uses_local_date_not_utc_date(self):
+        """22:00 UTC on 24 December is already 00:00 on Christmas Day
+        in Bucharest (UTC+2), so it must count as a holiday."""
+        index = pd.DatetimeIndex(
+            ["2025-12-24 21:00", "2025-12-24 22:00"], tz="UTC"
+        )
+        df = pd.DataFrame({"load_mw": [1.0, 2.0]}, index=index)
+
+        result = add_holiday_features(df)
+
+        assert list(result["is_holiday_local"]) == [False, True]
+
+    def test_day_before_new_year_crosses_year_boundary(self):
+        df = self._daily_frame("2025-12-31", days=1)
+
+        result = add_holiday_features(df)
+
+        assert result["is_day_before_holiday_local"].iloc[0]
+
+    def test_index_stays_utc(self):
+        index = _hourly_index("2025-12-24", periods=48)
+        df = pd.DataFrame({"load_mw": range(48)}, index=index)
+
+        result = add_holiday_features(df)
+
+        assert result.index.equals(index)
+        assert str(result.index.tz) == "UTC"
+
+    def test_raises_on_tz_naive_index(self):
+        index = pd.date_range("2026-01-01", periods=5, freq="h")
+        df = pd.DataFrame({"load_mw": range(5)}, index=index)
+
+        with pytest.raises(TypeError, match="timezone-aware"):
+            add_holiday_features(df)
 
 
 
