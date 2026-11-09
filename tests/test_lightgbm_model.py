@@ -235,3 +235,51 @@ class TestMakeLightgbmForecaster:
 
         pd.testing.assert_series_equal(forecast_a, forecast_b)
 
+
+
+class TestExogenousFeatures:
+    def _exog(self, index: pd.DatetimeIndex) -> pd.DataFrame:
+        rng = np.random.default_rng(0)
+        return pd.DataFrame({"temperature_c": rng.normal(size=len(index))}, index=index)
+
+    def test_forecaster_trains_on_exog_columns(self, monkeypatch):
+        history = _load_history()
+        full_index = pd.date_range(history.index[0], periods=len(history) + 24, freq="h")
+        trained_columns: list[list[str]] = []
+
+        from energy_load_forecast.models import lightgbm_model
+
+        original = lightgbm_model.train_lightgbm
+
+        def recording_train(X_train, y_train, **params):
+            trained_columns.append(list(X_train.columns))
+            return original(X_train, y_train, **params)
+
+        monkeypatch.setattr(lightgbm_model, "train_lightgbm", recording_train)
+        forecaster = make_lightgbm_forecaster(
+            exog=self._exog(full_index), n_estimators=5, verbose=-1
+        )
+
+        forecast = forecaster(history, 24)
+
+        assert "temperature_c" in trained_columns[0]
+        assert forecast.notna().all()
+
+    def test_raises_if_exog_does_not_cover_forecast_hours(self):
+        history = _load_history()
+        forecaster = make_lightgbm_forecaster(
+            exog=self._exog(history.index), n_estimators=5, verbose=-1
+        )
+
+        with pytest.raises(ValueError, match="exog is missing 24 timestamps"):
+            forecaster(history, 24)
+
+    def test_raises_if_exog_has_nan_for_forecast_hours(self):
+        history = _load_history()
+        full_index = pd.date_range(history.index[0], periods=len(history) + 24, freq="h")
+        exog = self._exog(full_index)
+        exog.iloc[-1] = np.nan
+        forecaster = make_lightgbm_forecaster(exog=exog, n_estimators=5, verbose=-1)
+
+        with pytest.raises(ValueError, match="NaN"):
+            forecaster(history, 24)

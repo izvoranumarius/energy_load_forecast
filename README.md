@@ -32,6 +32,8 @@ The ingestion layer supports:
 
 Timestamps are normalized to UTC and the load data is resampled to hourly resolution.
 
+Hourly air temperature is obtained from Open-Meteo, which does not require an API key. It is a population-weighted average of the eight largest Romanian cities. By default, archived weather forecasts are used instead of observed temperatures, so backtest results reflect what is known when a day-ahead forecast is made. Romanian public holidays come from the `holidays` package.
+
 The final experiment covers July 2025 through December 2025. Since the dataset contains only part of one year, yearly seasonality is treated as a limitation rather than estimated as a complete annual pattern.
 
 ## Project structure
