@@ -4,6 +4,7 @@ This module:
     - removes trailing NaN values caused by publication delays
     - verifies that the input is a continuous hourly UTC series
     - adds calendar features based on local time
+    - adds public holiday features based on local dates
     - splits the data chronologically into train, validation, and test sets
     - saves the resulting splits as CSV files
 
@@ -16,6 +17,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import holidays
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -127,6 +129,71 @@ def add_calendar_features(
     return out
 
 
+def add_holiday_features(
+    df: pd.DataFrame,
+    country: str = "RO",
+    tz: str = "Europe/Bucharest",
+) -> pd.DataFrame:
+    """Add public holiday features derived from local time.
+
+        Electricity load drops on public holidays and is often lower on the
+        days around them, when many people take extra days off. Holidays are
+        known in advance, so these features can be used for future timestamps
+        without data leakage.
+
+        Args:
+            df: DataFrame with a timezone-aware UTC DatetimeIndex.
+            country: Country code understood by the ``holidays`` package.
+                Defaults to ``"RO"``.
+            tz: IANA timezone used to determine the local date. Defaults to
+                ``"Europe/Bucharest"``.
+
+        Returns:
+            A copy of ``df`` with the following additional columns:
+                ``is_holiday_local``: Whether the local date is a public holiday.
+                ``is_day_before_holiday_local``: Whether the next local date is
+                    a public holiday.
+                ``is_day_after_holiday_local``: Whether the previous local date
+                    was a public holiday.
+
+        Raises:
+            TypeError: If the DataFrame index is not a timezone-aware
+                DatetimeIndex.
+            ValueError: If the index is not UTC.
+            NotImplementedError: If ``country`` is not supported by the
+                ``holidays`` package.
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError(
+            f"Expected a DatetimeIndex, got {type(df.index).__name__}"
+        )
+    if df.index.tz is None:
+        raise TypeError("DatetimeIndex must be timezone-aware")
+    if str(df.index.tz) != "UTC":
+        raise ValueError("DatetimeIndex must be UTC")
+
+    out = df.copy()
+    if df.empty:
+        out["is_holiday_local"] = pd.Series(dtype=bool)
+        out["is_day_before_holiday_local"] = pd.Series(dtype=bool)
+        out["is_day_after_holiday_local"] = pd.Series(dtype=bool)
+        return out
+
+    local_dates = df.index.tz_convert(tz).normalize().tz_localize(None)
+    # Include the neighbouring years so that holidays on 1 January and
+    # 31 December are found for the day-before and day-after features.
+    years = range(local_dates.min().year - 1, local_dates.max().year + 2)
+    holiday_dates = pd.DatetimeIndex(
+        list(holidays.country_holidays(country, years=years).keys())
+    )
+
+    one_day = pd.Timedelta(days=1)
+    out["is_holiday_local"] = local_dates.isin(holiday_dates)
+    out["is_day_before_holiday_local"] = (local_dates + one_day).isin(holiday_dates)
+    out["is_day_after_holiday_local"] = (local_dates - one_day).isin(holiday_dates)
+    return out
+
+
 def _as_utc_timestamp(value: str | pd.Timestamp) -> pd.Timestamp:
     """Convert a timestamp-like value to a UTC-aware Timestamp.
     
@@ -227,24 +294,27 @@ def preprocess(
     train_end: str | pd.Timestamp,
     val_end: str | pd.Timestamp,
     tz: str = "Europe/Bucharest",
+    country: str = "RO",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Prepare an hourly load series for modelling.
-    
-        The series is first trimmed at its last valid observation. Calendar
-        features are then added using the specified local timezone, and the
-        resulting DataFrame is split chronologically into train, validation,
-        and test sets.
-    
+
+        The series is first trimmed at its last valid observation. Calendar and
+        public holiday features are then added using the specified local
+        timezone, and the resulting DataFrame is split chronologically into
+        train, validation, and test sets.
+
         Args:
             series: Hourly, UTC-indexed ``load_mw`` series produced by ingestion.
             train_end: Timestamp marking the start of the validation period.
             val_end: Timestamp marking the start of the test period.
             tz: IANA timezone used to derive calendar features. Defaults to
                 ``"Europe/Bucharest"``.
-    
+            country: Country code used for public holiday features. Defaults
+                to ``"RO"``.
+
         Returns:
             A tuple containing the training, validation, and test DataFrames with
-            calendar features added.
+            calendar and holiday features added.
     
         Raises:
             TypeError: If ``series`` is not a valid pandas Series or the expected
@@ -254,6 +324,7 @@ def preprocess(
     trimmed = clean_tail(series)
     frame = trimmed.to_frame(name=trimmed.name or "load_mw")
     frame = add_calendar_features(frame, tz=tz)
+    frame = add_holiday_features(frame, country=country, tz=tz)
     return chronological_split(frame, train_end, val_end)
 
 
@@ -301,6 +372,7 @@ if __name__ == "__main__":
     parser.add_argument("--train-end", required=True)
     parser.add_argument("--val-end", required=True)
     parser.add_argument("--tz", default="Europe/Bucharest")
+    parser.add_argument("--country", default="RO")
     args = parser.parse_args()
 
     cached = pd.read_csv(args.input_csv, index_col="timestamp_utc")
@@ -310,5 +382,6 @@ if __name__ == "__main__":
         train_end=args.train_end,
         val_end=args.val_end,
         tz=args.tz,
+        country=args.country,
     )
     save_splits(train, val, test, args.output_dir)
