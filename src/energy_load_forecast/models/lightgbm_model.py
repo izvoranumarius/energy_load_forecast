@@ -5,15 +5,22 @@ This module:
     - trains separate LightGBM models for quantile forecasts
     - generates point and quantile predictions
     - reports feature importance
+    - produces recursive multi-step forecasts from a fitted model
+    - builds a forecasting function that retrains at each backtest origin
 
 The model wrapper is kept small so that feature engineering and evaluation
 remain separate from model training.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
+
+from energy_load_forecast.features import add_all_features
+from energy_load_forecast.preprocessing import add_calendar_features
 
 
 def train_lightgbm(X_train: pd.DataFrame, y_train: pd.Series, **lgbm_params) -> LGBMRegressor:
@@ -177,3 +184,126 @@ def predict_quantiles(
         for alpha, model in models.items()
     }
     return pd.DataFrame(predictions, index=X.index)
+
+
+def recursive_forecast(
+    model: LGBMRegressor,
+    history: pd.Series,
+    future_index: pd.DatetimeIndex,
+    feature_columns: list[str],
+    lags: tuple[int, ...] = (1, 24, 168),
+    windows: tuple[int, ...] = (3, 24),
+    tz: str = "Europe/Bucharest",
+) -> pd.Series:
+    """Forecast each future hour using previous observations or predictions.
+    
+        Lag and rolling features for the first forecast hour are built from the
+        observed history. Each prediction is then appended to the history and
+        used for the following hours, so actual values from the forecast
+        window never enter the features. Feature names follow
+        ``features.add_all_features`` and calendar features follow
+        ``preprocessing.add_calendar_features``.
+    
+        Args:
+            model: Fitted LightGBM model.
+            history: Hourly, UTC-indexed load series ending right before
+                ``future_index``.
+            future_index: Hourly UTC timestamps to forecast.
+            feature_columns: Feature names in the order used to train ``model``.
+            lags: Lag lengths in hours used when training ``model``.
+            windows: Rolling window lengths in hours used when training ``model``.
+            tz: IANA timezone used for calendar features. Defaults to
+                ``"Europe/Bucharest"``.
+    
+        Returns:
+            A Series of predicted load values indexed by ``future_index`` and
+            named ``forecast``.
+    
+        Raises:
+            TypeError: If ``history`` or ``future_index`` has the wrong type.
+            ValueError: If the history is too short for the requested lags and
+                windows, or ``future_index`` does not start right after it.
+            KeyError: If ``feature_columns`` contains a feature that cannot be
+                built from ``lags``, ``windows``, and the calendar features.
+    """
+    if not isinstance(history, pd.Series):
+        raise TypeError("history must be a pandas Series")
+    if not isinstance(future_index, pd.DatetimeIndex) or future_index.empty:
+        raise TypeError("future_index must be a non-empty DatetimeIndex")
+    if history.isna().any():
+        raise ValueError("history must not contain NaN values")
+    required_history = max((*lags, *windows))
+    if len(history) < required_history:
+        raise ValueError(
+            f"Need at least {required_history} hours of history, got {len(history)}"
+        )
+    if future_index[0] != history.index[-1] + pd.Timedelta(hours=1):
+        raise ValueError("future_index must start one hour after the end of history")
+
+    calendar = add_calendar_features(pd.DataFrame(index=future_index), tz=tz)
+    values = list(history.to_numpy(dtype=float))
+    predictions: list[float] = []
+
+    for timestamp in future_index:
+        row = calendar.loc[timestamp].to_dict()
+        for lag in lags:
+            row[f"load_mw_lag{lag}"] = values[-lag]
+        for window in windows:
+            row[f"load_mw_rolling_mean_{window}h"] = float(np.mean(values[-window:]))
+
+        X_row = pd.DataFrame([row], index=[timestamp])[feature_columns]
+        prediction = float(np.asarray(model.predict(X_row)).reshape(-1)[0])
+        predictions.append(prediction)
+        values.append(prediction)
+
+    return pd.Series(predictions, index=future_index, name="forecast")
+
+
+def make_lightgbm_forecaster(
+    lags: tuple[int, ...] = (1, 24, 168),
+    windows: tuple[int, ...] = (3, 24),
+    tz: str = "Europe/Bucharest",
+    **lgbm_params,
+) -> Callable[[pd.Series, int], pd.Series]:
+    """Build a forecasting function that retrains LightGBM on each history.
+    
+        The returned function matches the ``forecast_fn(history, horizon)``
+        signature used by ``backtesting.rolling_origin_backtest``. Every call
+        builds calendar, lag, and rolling features from ``history`` only,
+        removes rows without enough feature history, trains a new model, and
+        forecasts the next ``horizon`` hours recursively.
+    
+        Args:
+            lags: Lag lengths in hours. Defaults to 1, 24, and 168 hours.
+            windows: Rolling window lengths in hours. Defaults to 3 and 24 hours.
+            tz: IANA timezone used for calendar features. Defaults to
+                ``"Europe/Bucharest"``.
+            **lgbm_params: Parameters passed to ``train_lightgbm``.
+    
+        Returns:
+            A callable that takes an hourly UTC history and a horizon and
+            returns a Series of forecasts named ``forecast``.
+    """
+
+    def forecast(history: pd.Series, horizon: int) -> pd.Series:
+        frame = add_calendar_features(history.to_frame(name="load_mw"), tz=tz)
+        features = add_all_features(frame, lags=lags, windows=windows).dropna()
+        X_train = features.drop(columns=["load_mw"])
+        model = train_lightgbm(X_train, features["load_mw"], **lgbm_params)
+
+        future_index = pd.date_range(
+            history.index[-1] + pd.Timedelta(hours=1),
+            periods=horizon,
+            freq="h",
+        )
+        return recursive_forecast(
+            model,
+            history,
+            future_index,
+            list(X_train.columns),
+            lags=lags,
+            windows=windows,
+            tz=tz,
+        )
+
+    return forecast

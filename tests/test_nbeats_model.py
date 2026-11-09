@@ -12,7 +12,9 @@ import pytest
 
 pytest.importorskip("darts")
 
+from energy_load_forecast.models import nbeats_model
 from energy_load_forecast.models.nbeats_model import (
+    make_nbeats_forecaster,
     predict,
     series_to_darts,
     train_nbeats,
@@ -119,3 +121,39 @@ class TestPredict:
 
         with pytest.raises(ValueError, match="sorted"):
             predict(None, None, None, horizon=4, target_index=target_index)
+
+
+class TestMakeNbeatsForecaster:
+    def _count_training(self, monkeypatch) -> list[int]:
+        calls: list[int] = []
+        original = nbeats_model.train_nbeats
+
+        def counting_train(series, **kwargs):
+            calls.append(len(series))
+            return original(series, **kwargs)
+
+        monkeypatch.setattr(nbeats_model, "train_nbeats", counting_train)
+        return calls
+
+    def test_trains_once_by_default(self, monkeypatch):
+        calls = self._count_training(monkeypatch)
+        series = _hourly_series(periods=96)
+        forecaster = make_nbeats_forecaster(n_epochs=1)
+
+        first = forecaster(series.iloc[:60], 24)
+        second = forecaster(series.iloc[:72], 24)
+
+        assert calls == [60]
+        assert first.index[0] == series.index[60]
+        assert second.index[0] == series.index[72]
+
+    def test_retrains_on_every_call_when_requested(self, monkeypatch):
+        calls = self._count_training(monkeypatch)
+        series = _hourly_series(periods=96)
+        forecaster = make_nbeats_forecaster(n_epochs=1, retrain=True)
+
+        forecaster(series.iloc[:60], 24)
+        forecaster(series.iloc[:72], 24)
+
+        assert calls == [60, 72]
+

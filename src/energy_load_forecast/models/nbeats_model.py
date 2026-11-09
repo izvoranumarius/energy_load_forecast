@@ -15,8 +15,14 @@ UTC-aware index expected by the rest of the pipeline.
 
 The scaler is fitted only on the training data and reused for validation,
 test, and prediction.
+
+``make_nbeats_forecaster`` wraps training and prediction in the
+``forecast_fn(history, horizon)`` signature used for rolling-origin
+backtesting.
 """
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import pandas as pd
 import torch
@@ -199,3 +205,65 @@ def predict(
     forecast_series.index = target_index
     forecast_series.name = "forecast"
     return forecast_series
+
+
+def make_nbeats_forecaster(
+    input_chunk_length: int = 24,
+    output_chunk_length: int = 24,
+    n_epochs: int = 50,
+    random_state: int = 42,
+    use_gpu: bool = False,
+    retrain: bool = False,
+) -> Callable[[pd.Series, int], pd.Series]:
+    """Build a forecasting function for rolling-origin backtesting.
+    
+        The returned function matches the ``forecast_fn(history, horizon)``
+        signature used by ``backtesting.rolling_origin_backtest``.
+    
+        With ``retrain=False``, the model and scaler are trained once on the
+        history passed in the first call and reused for every later call. Since
+        backtest origins are processed in chronological order, the model only
+        sees data from before the earliest origin, while later forecasts still
+        use the most recent history as model input. This is much faster than
+        retraining but slightly pessimistic for later origins. A new forecaster
+        should be created for each backtest so that a model trained in one
+        backtest is not reused in another.
+    
+        Args:
+            input_chunk_length: Number of historical hours used for each
+                prediction.
+            output_chunk_length: Number of hours predicted by the model.
+            n_epochs: Number of training epochs.
+            random_state: Random seed used for reproducible training.
+            use_gpu: Whether to train using a GPU. Defaults to False.
+            retrain: Whether to train a new model on every call. Defaults to
+                False.
+    
+        Returns:
+            A callable that takes an hourly UTC history and a horizon and
+            returns a Series of forecasts named ``forecast``.
+    """
+    state: dict[str, NBEATSModel | Scaler] = {}
+
+    def forecast(history: pd.Series, horizon: int) -> pd.Series:
+        if retrain or not state:
+            model, scaler, _ = train_nbeats(
+                history,
+                input_chunk_length=input_chunk_length,
+                output_chunk_length=output_chunk_length,
+                n_epochs=n_epochs,
+                random_state=random_state,
+                use_gpu=use_gpu,
+            )
+            state["model"] = model
+            state["scaler"] = scaler
+
+        history_scaled = state["scaler"].transform(series_to_darts(history))
+        target_index = pd.date_range(
+            history.index[-1] + pd.Timedelta(hours=1),
+            periods=horizon,
+            freq="h",
+        )
+        return predict(state["model"], state["scaler"], history_scaled, horizon, target_index)
+
+    return forecast
