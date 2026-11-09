@@ -32,6 +32,8 @@ Proiectul poate utiliza:
 
 Marcajele temporale sunt aduse la UTC, iar datele sunt agregate la o frecvență de o oră.
 
+Temperatura orară a aerului este preluată din Open-Meteo, care nu necesită o cheie API. Aceasta este o medie ponderată cu populația pentru cele mai mari opt orașe din România. Implicit sunt folosite prognozele meteo arhivate, nu temperaturile observate, astfel încât rezultatele backtesting-ului reflectă informațiile disponibile în momentul în care se face o prognoză pentru ziua următoare. Sărbătorile legale din România sunt preluate din pachetul `holidays`.
+
 Experimentul final folosește date din perioada iulie 2025 - decembrie 2025. Deoarece perioada acoperă doar o parte dintr-un an, sezonalitatea anuală este tratată ca o limitare a setului de date și nu este estimată ca un tipar anual complet.
 
 ## Structura proiectului

@@ -7,6 +7,8 @@ This module:
     - reports feature importance
     - produces recursive multi-step forecasts from a fitted model
     - builds a forecasting function that retrains at each backtest origin
+    - optionally adds exogenous features, such as temperature, that are known
+      for the forecast hours
 
 The model wrapper is kept small so that feature engineering and evaluation
 remain separate from model training.
@@ -189,6 +191,35 @@ def predict_quantiles(
     return pd.DataFrame(predictions, index=X.index)
 
 
+def _select_exog(exog: pd.DataFrame, index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Select exogenous features for the requested timestamps.
+    
+        Args:
+            exog: DataFrame of exogenous features indexed by hourly UTC
+                timestamps.
+            index: Timestamps for which features are required.
+    
+        Returns:
+            The rows of ``exog`` for ``index``, in the same order.
+    
+        Raises:
+            TypeError: If ``exog`` is not a pandas DataFrame.
+            ValueError: If ``exog`` is missing timestamps or contains NaN values
+                for the requested timestamps.
+    """
+    if not isinstance(exog, pd.DataFrame):
+        raise TypeError("exog must be a pandas DataFrame")
+    missing = index.difference(exog.index)
+    if not missing.empty:
+        raise ValueError(
+            f"exog is missing {len(missing)} timestamps, first missing: {missing[0]}"
+        )
+    selected = exog.loc[index]
+    if selected.isna().any().any():
+        raise ValueError("exog contains NaN values for the requested timestamps")
+    return selected
+
+
 def recursive_forecast(
     model: LGBMRegressor,
     history: pd.Series,
@@ -198,6 +229,7 @@ def recursive_forecast(
     windows: tuple[int, ...] = (3, 24),
     tz: str = "Europe/Bucharest",
     country: str = "RO",
+    exog: pd.DataFrame | None = None,
 ) -> pd.Series:
     """Forecast each future hour using previous observations or predictions.
     
@@ -221,6 +253,11 @@ def recursive_forecast(
                 ``"Europe/Bucharest"``.
             country: Country code used for holiday features. Defaults to
                 ``"RO"``.
+            exog: Optional DataFrame of exogenous features, such as
+                ``temperature_c``, indexed by hourly UTC timestamps. It must
+                cover every timestamp in ``future_index``. For an honest
+                forecast these values must be known in advance, for example
+                weather forecasts rather than observed weather.
     
         Returns:
             A Series of predicted load values indexed by ``future_index`` and
@@ -229,10 +266,11 @@ def recursive_forecast(
         Raises:
             TypeError: If ``history`` or ``future_index`` has the wrong type.
             ValueError: If the history is too short for the requested lags and
-                windows, or ``future_index`` does not start right after it.
+                windows, ``future_index`` does not start right after it, or
+                ``exog`` does not cover ``future_index``.
             KeyError: If ``feature_columns`` contains a feature that cannot be
-                built from ``lags``, ``windows``, and the calendar and
-                holiday features.
+                built from ``lags``, ``windows``, the calendar and holiday
+                features, and ``exog``.
     """
     if not isinstance(history, pd.Series):
         raise TypeError("history must be a pandas Series")
@@ -250,6 +288,8 @@ def recursive_forecast(
 
     calendar = add_calendar_features(pd.DataFrame(index=future_index), tz=tz)
     calendar = add_holiday_features(calendar, country=country, tz=tz)
+    if exog is not None:
+        calendar = calendar.join(_select_exog(exog, future_index))
     values = list(history.to_numpy(dtype=float))
     predictions: list[float] = []
 
@@ -273,6 +313,7 @@ def make_lightgbm_forecaster(
     windows: tuple[int, ...] = (3, 24),
     tz: str = "Europe/Bucharest",
     country: str = "RO",
+    exog: pd.DataFrame | None = None,
     **lgbm_params,
 ) -> Callable[[pd.Series, int], pd.Series]:
     """Build a forecasting function that retrains LightGBM on each history.
@@ -280,8 +321,9 @@ def make_lightgbm_forecaster(
         The returned function matches the ``forecast_fn(history, horizon)``
         signature used by ``backtesting.rolling_origin_backtest``. Every call
         builds calendar, holiday, lag, and rolling features from ``history`` only,
-        removes rows without enough feature history, trains a new model, and
-        forecasts the next ``horizon`` hours recursively.
+        adds the optional exogenous features, removes rows without enough
+        feature history, trains a new model, and forecasts the next ``horizon``
+        hours recursively.
     
         Args:
             lags: Lag lengths in hours. Defaults to 1, 24, and 168 hours.
@@ -290,6 +332,9 @@ def make_lightgbm_forecaster(
                 ``"Europe/Bucharest"``.
             country: Country code used for holiday features. Defaults to
                 ``"RO"``.
+            exog: Optional DataFrame of exogenous features indexed by hourly
+                UTC timestamps. It must cover both the history and the forecast
+                hours of every call.
             **lgbm_params: Parameters passed to ``train_lightgbm``.
     
         Returns:
@@ -300,6 +345,8 @@ def make_lightgbm_forecaster(
     def forecast(history: pd.Series, horizon: int) -> pd.Series:
         frame = add_calendar_features(history.to_frame(name="load_mw"), tz=tz)
         frame = add_holiday_features(frame, country=country, tz=tz)
+        if exog is not None:
+            frame = frame.join(_select_exog(exog, frame.index))
         features = add_all_features(frame, lags=lags, windows=windows).dropna()
         X_train = features.drop(columns=["load_mw"])
         model = train_lightgbm(X_train, features["load_mw"], **lgbm_params)
@@ -318,6 +365,7 @@ def make_lightgbm_forecaster(
             windows=windows,
             tz=tz,
             country=country,
+            exog=exog,
         )
 
     return forecast
